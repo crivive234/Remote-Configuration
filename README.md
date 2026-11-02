@@ -1,6 +1,6 @@
 # configure-remote.ps1
 
-Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSession`) en un equipo de la red a partir de su dirección IP. Antes de conectar, prepara el servicio **WinRM** en el equipo remoto, registra la IP en **TrustedHosts** del equipo local y verifica que el remoto responda.
+Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSession`) en un equipo de la red a partir de su dirección IP. Antes de conectar, prepara el servicio **WinRM** en el equipo remoto, registra la IP en **TrustedHosts** del equipo local, verifica que el remoto responda y genera el comando exacto para restaurar la seguridad al terminar.
 
 ---
 
@@ -25,12 +25,13 @@ Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSes
 | # | Tarea | Dónde se ejecuta |
 |---|-------|------------------|
 | 1 | Obtiene y valida la IP (parámetro o `Read-Host`) | Local |
-| 2 | Comprueba conectividad con `Test-Connection` (solo aviso) | Local → Remoto |
-| 3 | Deja WinRM en inicio automático y lo inicia con `sc.exe` (omitible) | Remoto |
-| 4 | Agrega la IP a `TrustedHosts` con comparación exacta | Local |
-| 5 | Solicita dominio, usuario y contraseña (esta última oculta) | Local |
+| 2 | Comprueba conectividad con `Test-Connection` y verifica MAC opcionalmente | Local → Remoto |
+| 3 | Solicita dominio, usuario y contraseña (esta última oculta) | Local |
+| 4 | Deja WinRM en inicio automático y lo inicia mediante CIM/DCOM (omitible) | Remoto |
+| 5 | Agrega temporalmente la IP a `TrustedHosts` con comparación exacta | Local |
 | 6 | Verifica que WinRM responda con `Test-WSMan` | Local → Remoto |
-| 7 | Abre la sesión con `Enter-PSSession` | Local → Remoto |
+| 7 | Verifica el nombre del equipo (si se especifica `-ExpectedHostName`) | Remoto |
+| 8 | Abre la sesión con `Enter-PSSession` y genera el comando de limpieza | Local → Remoto |
 
 ---
 
@@ -45,7 +46,7 @@ Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSes
 **Equipo remoto:**
 
 - Una cuenta con permisos de administrador sobre el equipo, para abrir la sesión.
-- Firewall que permita **WinRM** (puerto **5985**) y, si no se usa `-SkipServiceSetup`, **RPC/SMB** (puertos 135 y 445) para `sc.exe`.
+- Firewall que permita **WinRM** (puerto **5985**) y, si no se usa `-SkipServiceSetup`, **DCOM/RPC** (puertos 135 y dinámicos) para el inicio remoto del servicio.
 - Equipo encendido y alcanzable por IP.
 
 ---
@@ -65,24 +66,27 @@ Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSes
    .\configure-remote.ps1
    ```
 
-4. Escribe la IP cuando se te solicite y luego el **dominio** (Enter para usar `ititpa.itic`), el **usuario** y la **contraseña** (no se muestra al escribir).
-5. Al conectar, el prompt cambia a `[10.158.131.20]: PS C:\...>`. Para cerrar la sesión remota:
+4. Escribe la IP cuando se te solicite y luego el **dominio** (Enter para usar el sugerido), el **usuario** y la **contraseña** (no se muestra al escribir).
+5. El script imprimirá un comando en color cyan para limpiar tu `TrustedHosts`. Cópialo.
+6. Al conectar, el prompt cambia a `[IP]: PS C:\...>`. Para cerrar la sesión remota:
 
    ```powershell
    Exit-PSSession
    ```
+7. Pega y ejecuta localmente el comando cyan que copiaste en el paso 5.
+8. Elimina la sesión huérfana localmente con `Remove-PSSession -Id <ID>` (el script te indicará el ID).
 
 **Otras formas de ejecutarlo:**
 
 ```powershell
 # Pasando la IP directamente
-.\configure-remote.ps1 -IP 10.158.131.20
+.\configure-remote.ps1 -IP 10.158.132.190
 
-# Si WinRM ya está activo en el remoto (omite sc.exe)
-.\configure-remote.ps1 -IP 10.158.131.20 -SkipServiceSetup
+# Si WinRM ya está activo en el remoto (omite el inicio del servicio)
+.\configure-remote.ps1 -IP 10.158.132.190 -SkipServiceSetup
 
-# Indicando dominio y usuario (solo pedirá la contraseña)
-.\configure-remote.ps1 -IP 10.158.131.20 -Domain ititpa.itic -UserName cristian.viasus
+# Verificando la identidad del equipo destino por MAC y nombre antes de conectar
+.\configure-remote.ps1 -IP 10.158.132.190 -MacAddress AA-BB-CC-DD-EE-FF -ExpectedHostName OTD-80P7TM-155
 ```
 
 ---
@@ -91,11 +95,15 @@ Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSes
 
 | Parámetro | Tipo | Obligatorio | Descripción |
 |-----------|------|-------------|-------------|
-| `-IP` | `string` | No | IPv4 del equipo remoto. Si se omite, se solicita por pantalla. Admite uso posicional (`.\configure-remote.ps1 10.0.0.5`). |
-| `-Domain` | `string` | No | Dominio del usuario. Por defecto `ititpa.itic`. Al ejecutar el script se puede aceptar con Enter o escribir otro. |
-| `-UserName` | `string` | No | Usuario **sin dominio** (ej. `cristian.viasus`). Si se omite, se solicita por pantalla. También acepta `DOMINIO\usuario` o `usuario@dominio`; en ese caso no se agrega el dominio. |
-| `-Credential` | `PSCredential` | No | Credencial ya construida (por ejemplo, desde `Get-Credential` o SecretManagement). Si se pasa, el script no pide dominio, usuario ni contraseña. |
-| `-SkipServiceSetup` | `switch` | No | Omite el paso de `sc.exe` sobre el equipo remoto. |
+| `-IP` | `string` | No | IPv4 del equipo remoto. Si se omite, se solicita por pantalla. Admite uso posicional. |
+| `-Domain` | `string` | No | Dominio del usuario. Al ejecutar, sugiere el dominio actual del entorno. |
+| `-UserName` | `string` | No | Usuario **sin dominio**. Si se omite, se solicita por pantalla. Acepta formatos `DOMINIO\usuario` o `usuario@dominio`. |
+| `-Credential` | `PSCredential` | No | Credencial ya construida. Si se pasa, no pide dominio, usuario ni contraseña. |
+| `-MacAddress` | `string` | No | MAC esperada del equipo. Si no coincide con la red local, el script aborta antes de enviar credenciales. |
+| `-ExpectedHostName` | `string` | No | Nombre de equipo esperado. Se verifica después de iniciar sesión; si difiere, cierra la sesión. |
+| `-SkipServiceSetup` | `switch` | No | Omite el intento de iniciar WinRM en el remoto mediante CIM/DCOM. |
+| `-EnableAutoStart` | `switch` | No | Configura el servicio WinRM remoto para que inicie automáticamente. |
+| `-Force` | `switch` | No | Omite la confirmación manual [S/n] antes de agregar la IP a TrustedHosts. |
 
 ---
 
@@ -103,52 +111,31 @@ Script de PowerShell para abrir una **sesión remota interactiva** (`Enter-PSSes
 
 ### 1. Validación de la IP
 
-Si no se pasa `-IP`, se pide con `Read-Host`. El script termina con código `1` si el valor está vacío o no es una **IPv4 válida** (cuatro octetos entre 0 y 255).
+Si no se pasa `-IP`, se pide con `Read-Host`. Valida que sea una **IPv4 estricta** (sin ceros a la izquierda y descartando direcciones reservadas/loopback).
 
-### 2. Conectividad
+### 2. Conectividad e Identidad Preventiva
 
-Se envía un ping. Si no hay respuesta solo se muestra una advertencia, porque muchos equipos bloquean ICMP pero sí aceptan WinRM.
+Se envía un ping. Adicionalmente, si se especifica `-MacAddress`, borra la caché ARP local y verifica que la MAC actual de la IP coincida con la esperada, protegiendo contra cambios de lease DHCP.
 
-### 3. WinRM en el equipo remoto
+### 3. Credenciales
 
-```powershell
-sc.exe "\\$IP" config WinRM start= auto
-sc.exe "\\$IP" start WinRM
-```
+Si no se pasó `-Credential`, solicita dominio (sugiriendo el actual), usuario y contraseña (como `SecureString`).
 
-- Se revisa el código de salida de cada comando y se muestra una **advertencia** si fallan.
-- El código `1056` (servicio ya en ejecución) se considera correcto.
-- ⚠️ `sc.exe` usa la **identidad de Windows con la que ejecutas el script**, no las credenciales que escribes en el paso 5. Si tu usuario actual no es administrador del remoto, usa `-SkipServiceSetup` o activa WinRM por otro medio.
+### 4. WinRM en el equipo remoto
 
-### 4. TrustedHosts
+Intenta iniciar el servicio remotamente utilizando **CIM sobre DCOM**, autenticándose con las credenciales suministradas (no con las del usuario que ejecuta el script localmente). 
 
-El script lee la lista actual, la separa por comas y compara **valor exacto**:
+### 5. TrustedHosts
 
-- Si la lista contiene `*`, no se modifica.
-- Si la IP ya está, no se hace nada.
-- En otro caso, se agrega al final.
+Verifica la lista local y, si la IP no está, la agrega. Pide confirmación previa a menos que se use `-Force`. 
 
-### 5. Credenciales
+### 6. Verificación y Sesión Interactiva
 
-Si no se pasó `-Credential`, el script pregunta en este orden:
+Confirma que WinRM responda (`Test-WSMan`) y establece la conexión. Si se usó `-ExpectedHostName`, coteja que sea el host correcto.
 
-1. **Dominio**: muestra el valor por defecto entre corchetes (`Dominio [ititpa.itic]`). Presiona Enter para aceptarlo o escribe otro.
-2. **Usuario**: sin dominio (por ejemplo `cristian.viasus`). Si ya lo escribes como `DOMINIO\usuario` o `usuario@dominio`, el script lo usa tal cual.
-3. **Contraseña**: se escribe oculta (`Read-Host -AsSecureString`) y nunca se guarda en texto plano.
+### 7. Generación de Limpieza
 
-Con eso arma el usuario completo (`ititpa.itic\cristian.viasus`) y crea el `PSCredential`. Si el usuario o la contraseña quedan vacíos, el script termina.
-
-### 6. Verificación de WinRM
-
-`Test-WSMan` confirma que el servicio responde antes de intentar la sesión, para dar un mensaje de error claro si no lo hace.
-
-### 7. Sesión interactiva
-
-```powershell
-Enter-PSSession -ComputerName $IP -Credential $Credential
-```
-
-Es la **última instrucción** del script: al terminar, quedas en el prompt remoto hasta que ejecutes `Exit-PSSession`.
+Calcula el estado original de `TrustedHosts` e **imprime el comando exacto en color cyan** para que puedas revertir el cambio manualmente. Al finalizar, transfiere el control a `Enter-PSSession`.
 
 ---
 
@@ -156,17 +143,23 @@ Es la **última instrucción** del script: al terminar, quedas en el prompt remo
 
 ```
 PS C:\> .\configure-remote.ps1
-Introduce la IP del equipo remoto: 10.158.131.20
-Verificando e iniciando el servicio WinRM en 10.158.131.20...
-IP 10.158.131.20 agregada a TrustedHosts.
-Dominio [ititpa.itic]:
+Introduce la IP del equipo remoto: 10.158.132.190
+Dominio [ITITPA.ITIC]: ititpa.itic
 Usuario (sin dominio): cristian.viasus
-Contraseña de ititpa.itic\cristian.viasus: ********
-Conectando al equipo 10.158.131.20...
-[10.158.131.20]: PS C:\Users\admin\Documents> hostname
-PC-EJEMPLO-01
-[10.158.131.20]: PS C:\Users\admin\Documents> Exit-PSSession
-PS C:\>
+Contraseña de ititpa.itic\cristian.viasus: ******************
+Verificando e iniciando el servicio WinRM en 10.158.132.190...
+Se agregará 10.158.132.190 a TrustedHosts solo durante la conexión y se retirará después. ¿Continuar? [S/n]: S
+IP 10.158.132.190 agregada temporalmente a TrustedHosts.
+Conectando al equipo 10.158.132.190...
+Equipo remoto: OTD-80P7TM-155
+ATENCIÓN: Para retirar la IP de TrustedHosts al terminar, copia y ejecuta localmente este comando:
+Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value '' -Force
+Al terminar: Exit-PSSession  y luego  Remove-PSSession -Id 1
+[10.158.132.190]: PS C:\> hostname
+OTD-80P7TM-155
+[10.158.132.190]: PS C:\> Exit-PSSession
+PS C:\> Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value '' -Force
+PS C:\> Remove-PSSession -Id 1
 ```
 
 ---
@@ -175,33 +168,20 @@ PS C:\>
 
 | Síntoma | Causa probable | Solución |
 |---------|----------------|----------|
-| `#Requires` / "requiere elevación" al ejecutar | PowerShell sin privilegios de administrador | Abrir PowerShell **como administrador** |
-| "'X' no es una dirección IPv4 válida" | IP mal escrita o se ingresó un nombre de host | Escribir una IPv4 con formato `n.n.n.n` |
-| "No se pudo leer la configuración local de WinRM" | WinRM local sin configurar | `Enable-PSRemoting -Force` |
-| Advertencia de `sc.exe` con código **5** | Acceso denegado: tu usuario actual no es administrador del remoto | Usar `-SkipServiceSetup` o ejecutar PowerShell con una cuenta con permisos |
-| Advertencia de `sc.exe` con código **1722** | Servidor RPC no disponible (equipo apagado o puertos 135/445 bloqueados) | Revisar firewall y conectividad |
-| "WinRM no responde en ..." | Servicio detenido, puerto 5985 bloqueado o equipo apagado | `Test-NetConnection <IP> -Port 5985` y revisar firewall |
-| "No se pudo abrir la sesión" con acceso denegado | Usuario sin permisos, contraseña incorrecta o formato de usuario no aceptado | Verificar credenciales y pertenencia a administradores del remoto. Si el dominio completo falla, prueba el nombre corto (NetBIOS) o el formato `usuario@ititpa.itic` |
-
-**Comandos útiles de diagnóstico:**
-
-```powershell
-Test-NetConnection -ComputerName <IP> -Port 5985
-Test-WSMan -ComputerName <IP>
-sc.exe \\<IP> query WinRM
-Get-Item WSMan:\localhost\Client\TrustedHosts
-```
+| `#Requires` / "requiere elevación" | PowerShell sin privilegios de administrador | Abrir PowerShell **como administrador** |
+| Error `0x8009030e` / "logon session does not exist" | Se retiró la IP de `TrustedHosts` mientras la sesión estaba activa | Asegúrate de no limpiar `TrustedHosts` hasta **después** de ejecutar `Exit-PSSession` |
+| Fallo al gestionar WinRM remoto | CIM/DCOM bloqueado (puerto 135) o falta de permisos | Usar `-SkipServiceSetup` o revisar el firewall remoto |
+| "WinRM no responde en ..." | WinRM detenido o puerto 5985 bloqueado | Revisar firewall o ejecutar `Test-NetConnection <IP> -Port 5985` |
+| Access Denied al abrir sesión | Credenciales incorrectas o el usuario no es admin | Verificar contraseña y pertenencia al grupo Administradores local del destino |
 
 ---
 
 ## Seguridad
 
-- **Sin contraseñas en el código.** La versión anterior tenía una contraseña en texto plano; esta pide dominio, usuario y contraseña al ejecutarse, y la contraseña se maneja como `SecureString`. Si esa contraseña llegó a compartirse o guardarse fuera de un lugar controlado, **cámbiala**.
-- **No uses `*` en TrustedHosts.** Hace que el equipo confíe en cualquier destino y facilita ataques de suplantación. El script nunca lo agrega y, si ya existe, no lo toca.
-- **TrustedHosts es acumulativo.** Cada IP agregada permanece hasta que la quites ([ver cómo](#cómo-revertir-los-cambios)).
-- **Conexión por IP = autenticación NTLM**, no Kerberos. Si es posible, conéctate por nombre de host del dominio.
-- Si necesitas automatizar sin interacción, usa `Microsoft.PowerShell.SecretManagement` y pasa el resultado con `-Credential`, en lugar de escribir la clave en el script.
-- Usa el script **solo en equipos sobre los que tengas autorización**.
+- **Sin contraseñas guardadas**: Todo se maneja dinámicamente en memoria mediante objetos `SecureString` y `PSCredential`.
+- **Validaciones cruzadas**: Soporta verificación de MAC y Hostname para mitigar conexiones erróneas si la IP (lease DHCP) fue reasignada a otro equipo.
+- **Autenticación NTLM**: La conexión directa por IP fuerza el uso de NTLM. Como el servidor remoto no se autentica ante ti de forma nativa (como sí lo haría Kerberos), es crucial limpiar `TrustedHosts` al terminar.
+- **TrustedHosts es acumulativo**: La instrucción en cyan que entrega el script está pre-calculada para dejar tu lista exactamente como estaba antes de ejecutarlo. Asegúrate de ejecutarla al terminar tu trabajo.
 
 ---
 
@@ -209,18 +189,17 @@ Get-Item WSMan:\localhost\Client\TrustedHosts
 
 - Solo acepta **IPv4**, no nombres de host ni IPv6.
 - Usa HTTP (5985); no contempla HTTPS (5986).
-- `sc.exe` no usa la credencial ingresada, sino la sesión actual de Windows.
-- Las entradas agregadas a `TrustedHosts` **no se eliminan automáticamente** al terminar. Como `Enter-PSSession` deja el prompt remoto al finalizar el script, no es posible ejecutar una limpieza fiable "después" de la sesión.
-- Si no hay respuesta de ping, el script continúa (puede ser un bloqueo de ICMP).
+- **Limpieza manual obligatoria**: Debido a que el script finaliza delegando el control a la consola interactiva (`Enter-PSSession`), es técnicamente imposible que el mismo script elimine automáticamente la IP de `TrustedHosts` tras salir de la sesión sin romper la autenticación NTLM en el proceso. Debe hacerse copiando y pegando el comando proporcionado.
 
 ---
 
 ## Cómo revertir los cambios
 
-**Quitar una IP de TrustedHosts (equipo local, PowerShell como administrador):**
+Si olvidaste copiar el comando proporcionado por el script, puedes limpiar la IP manualmente:
 
+**Quitar una IP específica (ejemplo 10.158.132.190):**
 ```powershell
-$ip = '10.158.131.20'
+$ip = '10.158.132.190'
 $lista = (Get-Item WSMan:\localhost\Client\TrustedHosts).Value -split ',' |
          ForEach-Object { $_.Trim() } |
          Where-Object { $_ -and $_ -ne $ip }
@@ -228,16 +207,8 @@ Set-Item WSMan:\localhost\Client\TrustedHosts -Value ($lista -join ',') -Force
 ```
 
 **Vaciar TrustedHosts por completo:**
-
 ```powershell
 Clear-Item WSMan:\localhost\Client\TrustedHosts -Force
-```
-
-**Devolver WinRM a inicio manual en el equipo remoto (opcional):**
-
-```powershell
-sc.exe \\<IP> config WinRM start= demand
-sc.exe \\<IP> stop WinRM
 ```
 
 ---
@@ -247,10 +218,7 @@ sc.exe \\<IP> stop WinRM
 | Antes | Ahora |
 |-------|-------|
 | Contraseña y usuario fijos en el código | Se piden dominio, usuario y contraseña oculta (o se usa `-Credential`) |
-| Sin validación de la IP | Validación de formato IPv4 |
-| Errores de `sc.exe` silenciados | Se revisa el código de salida y se advierte |
-| `-notlike "*$IP*"` (coincidencia parcial) | Comparación exacta sobre la lista |
-| Reemplazaba `*` en TrustedHosts por la IP | Respeta `*` y no modifica la lista |
-| Sin comprobación de privilegios | `#Requires -RunAsAdministrator` |
-| Error genérico si WinRM fallaba | `Test-WSMan` previo y mensajes de error claros |
-| Sin parámetros | `-IP`, `-Domain`, `-UserName`, `-Credential`, `-SkipServiceSetup` |
+| Activación remota usando `sc.exe` | Activación remota moderna utilizando **CIM (DCOM)** con las credenciales provistas |
+| Limpieza automática de TrustedHosts | **Comando de limpieza generado manualmente** para evitar el error `0x8009030e` que rompía la sesión interactiva NTLM |
+| Sin verificación de identidad | Soporte opcional de verificación cruzada mediante `-MacAddress` y `-ExpectedHostName` |
+| Sin advertencia de limpieza | El script indica los comandos exactos de limpieza (`Set-Item` y `Remove-PSSession`) antes de abrir la consola |
