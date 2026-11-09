@@ -12,12 +12,15 @@
     1. Valida la IP (IPv4 estricta: sin ceros a la izquierda ni direcciones especiales).
     2. Comprueba conectividad (ping) y, si se indica -MacAddress, verifica que la MAC
        asociada a esa IP coincida con la esperada (p. ej. la del lease DHCP) ANTES de
-       enviar cualquier credencial.
+       enviar cualquier credencial. Después prueba los puertos 5985 (WinRM) y 135 (DCOM):
+       si WinRM ya responde, omite el inicio remoto del servicio; si ninguno responde,
+       avisa y pregunta antes de continuar (por defecto cancela y vuelve a pedir la IP).
     3. Solicita dominio, usuario y contraseña por pantalla (solo la primera vez; luego se
        reutilizan en memoria hasta que se escriba 'c' en el prompt de la IP o termine el
        script). Nada queda guardado en el script ni en disco.
-    4. (Opcional) Inicia WinRM en el equipo remoto usando esas MISMAS credenciales
-       (CIM sobre DCOM), no la identidad de Windows de quien ejecuta el script.
+    4. (Opcional) Si WinRM aún no responde, lo inicia en el equipo remoto usando esas
+       MISMAS credenciales (CIM sobre DCOM), no la identidad de Windows de quien ejecuta
+       el script.
     5. Agrega la IP a TrustedHosts solo mientras dura la conexión y la retira
        automáticamente al salir (no se toca el comodín "*" ni las demás entradas).
     6. Abre la sesión y, si se indica -ExpectedHostName, comprueba que el equipo remoto
@@ -224,6 +227,86 @@ function Test-HostIdentity {
     return $true
 }
 
+# Prueba conexiones TCP a varios puertos en paralelo con un tiempo máximo común.
+# Devuelve una tabla hash puerto -> $true/$false (abierto/no alcanzable).
+function Test-TcpPorts {
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [Parameter(Mandatory)][int[]]$Ports,
+        [int]$TimeoutMs = 2000
+    )
+
+    $Clients = @{}
+    $Tasks = @{}
+
+    foreach ($Port in $Ports) {
+        $Clients[$Port] = New-Object System.Net.Sockets.TcpClient
+        try { $Tasks[$Port] = $Clients[$Port].ConnectAsync($IP, $Port) }
+        catch { $Tasks[$Port] = $null }
+    }
+
+    $Deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $Result = @{}
+
+    foreach ($Port in $Ports) {
+        $IsOpen = $false
+        if ($Tasks[$Port]) {
+            $Remaining = [int][Math]::Max(0, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            try { $IsOpen = ($Tasks[$Port].Wait($Remaining) -and $Clients[$Port].Connected) }
+            catch { $IsOpen = $false }   # conexión rechazada o con error
+        }
+        $Result[$Port] = [bool]$IsOpen
+        $Clients[$Port].Close()
+    }
+
+    return $Result
+}
+
+# Comprueba los puertos de WinRM (5985) y DCOM (135) ANTES de pedir credenciales.
+# Devuelve Proceed ($false = cancelar la conexión) y RunServiceSetup (si hay que iniciar WinRM por DCOM).
+function Test-RemoteReachability {
+    param([Parameter(Mandatory)][string]$IP)
+
+    Write-Host "Comprobando puertos en $IP (WinRM 5985 / DCOM 135)..." -ForegroundColor DarkGray
+
+    $Open = Test-TcpPorts -IP $IP -Ports 5985, 135
+    $WinRMOpen = $Open[5985]
+    $DcomOpen = $Open[135]
+    $RunSetup = -not $SkipServiceSetup
+
+    if ($WinRMOpen) {
+        Write-Host "WinRM (5985) responde en $IP." -ForegroundColor DarkGray
+
+        if ($RunSetup -and -not $EnableAutoStart) {
+            Write-Host "El servicio ya está activo; se omite el inicio remoto." -ForegroundColor DarkGray
+            $RunSetup = $false
+        }
+        elseif ($RunSetup -and -not $DcomOpen) {
+            Write-Warning "No se puede aplicar -EnableAutoStart: DCOM (135) no responde en $IP."
+            $RunSetup = $false
+        }
+
+        return [pscustomobject]@{ Proceed = $true; RunServiceSetup = $RunSetup }
+    }
+
+    if ($DcomOpen -and $RunSetup) {
+        Write-Host "WinRM (5985) no responde pero DCOM (135) sí: se intentará iniciar el servicio." -ForegroundColor Yellow
+        return [pscustomobject]@{ Proceed = $true; RunServiceSetup = $true }
+    }
+
+    # WinRM no responde y no hay forma de iniciarlo de forma remota
+    if ($DcomOpen) {
+        Write-Host "WinRM (5985) no responde en $IP y se indicó -SkipServiceSetup, así que el servicio no se iniciará." -ForegroundColor Red
+    }
+    else {
+        Write-Host "No se alcanzan los puertos 5985 (WinRM) ni 135 (DCOM) en ${IP}: el equipo puede estar apagado, en otra red o con el firewall bloqueando." -ForegroundColor Red
+        Write-Host "Si está encendido, activa WinRM en el propio equipo con 'Enable-PSRemoting -Force' (ver README)." -ForegroundColor Yellow
+    }
+
+    $Continue = Read-Confirmation "¿Intentar conectar de todos modos?" -DefaultYes $false
+    return [pscustomobject]@{ Proceed = $Continue; RunServiceSetup = $false }
+}
+
 # Pide dominio, usuario y contraseña. Devuelve un PSCredential o $null si se cancela.
 function Read-RemoteCredential {
     $DomainName = $script:StoredDomain
@@ -409,6 +492,15 @@ function Invoke-RemoteConnection {
     if (-not (Test-HostIdentity -IP $IP -ExpectedMac $ExpectedMac)) { return }
 
     # ------------------------------------------
+    # 2b. Alcance de red: puertos de WinRM y DCOM (antes de pedir credenciales)
+    # ------------------------------------------
+    $Reach = Test-RemoteReachability -IP $IP
+    if (-not $Reach.Proceed) {
+        Write-Host "Conexión cancelada." -ForegroundColor Yellow
+        return
+    }
+
+    # ------------------------------------------
     # 3. Credenciales de acceso (se piden una vez, solo en memoria)
     # ------------------------------------------
     if (-not $script:StoredCredential) {
@@ -418,9 +510,9 @@ function Invoke-RemoteConnection {
     $Cred = $script:StoredCredential
 
     # ------------------------------------------
-    # 4. Iniciar WinRM en el equipo remoto (con las credenciales del paso 3)
+    # 4. Iniciar WinRM en el equipo remoto (con las credenciales del paso 3), solo si hace falta
     # ------------------------------------------
-    if (-not $SkipServiceSetup) {
+    if ($Reach.RunServiceSetup) {
         Start-RemoteWinRM -IP $IP -Cred $Cred
     }
 

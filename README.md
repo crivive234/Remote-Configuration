@@ -29,9 +29,9 @@ El script trabaja en **bucle**: pide una IP, abre la sesión remota y, cuando sa
 | # | Tarea | Dónde se ejecuta |
 |---|-------|------------------|
 | 1 | Obtiene y valida la IP (parámetro la primera vez; después `Read-Host`) | Local |
-| 2 | Comprueba conectividad con `Test-Connection` y verifica la MAC opcionalmente | Local → Remoto |
+| 2 | Comprueba conectividad con `Test-Connection`, verifica la MAC opcionalmente y prueba los puertos 5985 (WinRM) y 135 (DCOM) | Local → Remoto |
 | 3 | Solicita dominio, usuario y contraseña **una sola vez** y los reutiliza en memoria | Local |
-| 4 | Inicia WinRM mediante CIM/DCOM (omitible). El inicio automático solo con `-EnableAutoStart` | Remoto |
+| 4 | Si WinRM aún no responde, lo inicia mediante CIM/DCOM (omitible). El inicio automático solo con `-EnableAutoStart` | Remoto |
 | 5 | Agrega temporalmente la IP a `TrustedHosts` con comparación exacta | Local |
 | 6 | Verifica que WinRM responda con `Test-WSMan` y crea la sesión | Local → Remoto |
 | 7 | Verifica el nombre del equipo (si se especifica `-ExpectedHostName`) | Remoto |
@@ -120,7 +120,8 @@ configure-remote.bat 10.158.132.190 -SkipServiceSetup
 | Se eleva solo | Comprueba si ya tiene permisos de administrador (`net session`). Si no, se relanza con UAC (`-Verb RunAs`) pasando los mismos argumentos |
 | Política de ejecución | Abre PowerShell con `-NoProfile -ExecutionPolicy Bypass`, que aplica **solo a ese proceso**; no cambia la política del equipo |
 | Pasa los argumentos | Todo lo que escribas después del nombre del `.bat` se entrega al script tal cual (`%*`) |
-| Mantiene la consola abierta | Usa `-NoExit`: al terminar el script (con `salir` y confirmación) quedas en un prompt local de PowerShell con permisos de administrador. Escribe `exit` para cerrar la ventana |
+| Cierra al terminar | Ya no usa `-NoExit`: al terminar el script (con `salir` y confirmación) la ventana se cierra sola |
+| Pausa si hay error | Si el script termina con un código distinto de 0 (por ejemplo, un `-MacAddress` inválido), muestra `El script termino con codigo N` y espera una tecla, para que puedas leer el mensaje |
 
 **Ejemplos:**
 
@@ -155,8 +156,8 @@ Con el [lanzador .bat](#lanzador-bat), estos parámetros se escriben después de
 | `-Credential` | `PSCredential` | No | Credencial ya construida. Si se pasa, no pide dominio, usuario ni contraseña, y se reutiliza en todas las conexiones. |
 | `-MacAddress` | `string` | No | MAC esperada del equipo de la **primera** conexión. Si no coincide con la red local, esa conexión se cancela antes de enviar credenciales. No aplica a las IP siguientes. |
 | `-ExpectedHostName` | `string` | No | Nombre de equipo esperado en la **primera** conexión. Se verifica después de abrir la sesión; si difiere, la cierra y vuelve al inicio. No aplica a las IP siguientes. |
-| `-SkipServiceSetup` | `switch` | No | Omite el intento de iniciar WinRM en el remoto mediante CIM/DCOM (en todas las conexiones). |
-| `-EnableAutoStart` | `switch` | No | Además de iniciar WinRM, lo deja en inicio automático en el remoto. Por defecto **no** se cambia el tipo de inicio. |
+| `-SkipServiceSetup` | `switch` | No | Omite el intento de iniciar WinRM en el remoto mediante CIM/DCOM (en todas las conexiones). Si WinRM (5985) tampoco responde, el script avisa y pregunta antes de continuar. |
+| `-EnableAutoStart` | `switch` | No | Además de iniciar WinRM, lo deja en inicio automático en el remoto. Por defecto **no** se cambia el tipo de inicio. Requiere que DCOM (135) responda, aunque WinRM ya esté activo. |
 | `-Force` | `switch` | No | Omite la confirmación `[S/n]` antes de agregar la IP a `TrustedHosts`. No afecta a las confirmaciones de salida. |
 
 ---
@@ -173,13 +174,22 @@ Cuando termina una conexión, el script regresa a este paso.
 
 Se envía un ping (si no responde, solo avisa y continúa). Si se especificó `-MacAddress`, borra la caché ARP local y verifica que la MAC actual de la IP coincida con la esperada, protegiendo contra cambios de lease DHCP. El formato de `-MacAddress` se valida al iniciar el script; si es inválido, el script termina con código de salida 1.
 
+Después prueba los puertos **5985** (WinRM) y **135** (DCOM) en paralelo, con un tiempo máximo de 2 segundos, **antes de pedir credenciales**:
+
+| Resultado | Qué hace el script |
+|-----------|--------------------|
+| 5985 responde | Continúa y omite el inicio remoto del servicio, porque WinRM ya está activo. Con `-EnableAutoStart` y 135 abierto sí lo ejecuta para configurar el inicio automático; si 135 está cerrado, avisa de que no puede aplicarlo |
+| 5985 no responde y 135 sí | Continúa e intenta iniciar WinRM por DCOM (paso 4) |
+| Ninguno responde | Avisa de que el equipo puede estar apagado, en otra red o con el firewall bloqueando, y pregunta `¿Intentar conectar de todos modos? [s/N]`. Por defecto cancela y vuelve a pedir la IP |
+| 5985 no responde, 135 sí, y se usó `-SkipServiceSetup` | Igual que el caso anterior: avisa que el servicio no se iniciará y pregunta `[s/N]` |
+
 ### 3. Credenciales
 
 La primera vez que se llega a este paso, se solicitan dominio (sugiriendo el actual), usuario y contraseña (como `SecureString`). Quedan **en memoria hasta que el script se cierre**, y se usan en las conexiones siguientes sin volver a preguntar. Para cambiarlas, escribe `c` en el prompt de la IP.
 
 ### 4. WinRM en el equipo remoto
 
-Intenta iniciar el servicio remotamente utilizando **CIM sobre DCOM**, autenticándose con las credenciales suministradas (no con las del usuario que ejecuta el script localmente). Por defecto **solo inicia** el servicio; con `-EnableAutoStart` además lo deja en inicio automático. Si falla, avisa y continúa de todos modos. Ver [Si WinRM no se puede iniciar de forma remota](#si-winrm-no-se-puede-iniciar-de-forma-remota).
+Si WinRM no respondía y DCOM sí (o se pidió `-EnableAutoStart`), intenta iniciar el servicio remotamente utilizando **CIM sobre DCOM**, autenticándose con las credenciales suministradas (no con las del usuario que ejecuta el script localmente). Por defecto **solo inicia** el servicio; con `-EnableAutoStart` además lo deja en inicio automático. Si falla, avisa y continúa de todos modos. Ver [Si WinRM no se puede iniciar de forma remota](#si-winrm-no-se-puede-iniciar-de-forma-remota).
 
 ### 5. TrustedHosts
 
@@ -247,10 +257,12 @@ El script **no usa `Enter-PSSession`**. Ese comando no devuelve el control al sc
 PS C:\> .\configure-remote.ps1
 
 Introduce la IP del equipo remoto ('salir' para terminar, 'c' para cambiar credenciales): 10.158.132.190
+Comprobando puertos en 10.158.132.190 (WinRM 5985 / DCOM 135)...
+WinRM (5985) responde en 10.158.132.190.
+El servicio ya está activo; se omite el inicio remoto.
 Dominio [ITITPA.ITIC]: ititpa.itic
 Usuario (sin dominio): cristian.viasus
 Contraseña de ititpa.itic\cristian.viasus: ******************
-Verificando e iniciando el servicio WinRM en 10.158.132.190...
 Se agregará 10.158.132.190 a TrustedHosts solo durante la conexión y se retirará al salir. ¿Continuar? [S/n]: S
 IP 10.158.132.190 agregada temporalmente a TrustedHosts.
 Conectando al equipo 10.158.132.190...
@@ -272,6 +284,19 @@ Introduce la IP del equipo remoto ('salir' para terminar, 'c' para cambiar crede
 Script finalizado.
 ```
 
+**Ejemplo con un equipo inalcanzable** (no se piden credenciales):
+
+```
+Introduce la IP del equipo remoto ('salir' para terminar, 'c' para cambiar credenciales): 10.158.135.163
+Comprobando puertos en 10.158.135.163 (WinRM 5985 / DCOM 135)...
+No se alcanzan los puertos 5985 (WinRM) ni 135 (DCOM) en 10.158.135.163: el equipo puede estar apagado, en otra red o con el firewall bloqueando.
+Si está encendido, activa WinRM en el propio equipo con 'Enable-PSRemoting -Force' (ver README).
+¿Intentar conectar de todos modos? [s/N]: n
+Conexión cancelada.
+
+Conexión finalizada. Volviendo al inicio...
+```
+
 ---
 
 ## Solución de problemas
@@ -281,9 +306,10 @@ Script finalizado.
 | `#Requires` / "requiere elevación" | PowerShell sin privilegios de administrador | Abrir PowerShell **como administrador**, o usar el [lanzador .bat](#lanzador-bat), que se eleva solo |
 | `No se encontro el script` (lanzador .bat) | `configure-remote.bat` no está en la misma carpeta que `configure-remote.ps1` | Guardar ambos archivos juntos |
 | El lanzador no abre nada tras el aviso de UAC | Se canceló el aviso de control de cuentas | Volver a ejecutar el `.bat` y aceptar el aviso |
-| La ventana sigue abierta en `PS C:\>` después de `Script finalizado.` | El lanzador usa `-NoExit` | Es normal; escribe `exit` para cerrar la ventana |
+| El lanzador muestra `El script termino con codigo N` y espera una tecla | El script terminó con error (por ejemplo, un `-MacAddress` inválido da código 1) | Lee el mensaje anterior, corrige y vuelve a ejecutar |
 | Error `0x8009030e` / "logon session does not exist" | Se modificó `TrustedHosts` a mano mientras la sesión estaba activa | No debería ocurrir con el script, que retira la IP después de cerrar la sesión. No edites `TrustedHosts` mientras estás conectado |
 | `WARNING: ... no responde a ping` | El equipo está apagado o bloquea ICMP | Es solo un aviso; el script continúa. Si además falla WinRM, revisa que el equipo esté encendido y alcanzable |
+| `No se alcanzan los puertos 5985 (WinRM) ni 135 (DCOM)` | El equipo está apagado, en otra red o con el firewall bloqueando ambos puertos | Verifica que esté encendido y alcanzable; si lo está, activa WinRM en el propio equipo (ver [Si WinRM no se puede iniciar de forma remota](#si-winrm-no-se-puede-iniciar-de-forma-remota)). Si crees que fue un falso negativo, responde `s` a `¿Intentar conectar de todos modos?` |
 | `No se pudo gestionar WinRM en ... Timed out` | CIM/DCOM bloqueado (puerto 135) o equipo inalcanzable | Usar `-SkipServiceSetup` o ver [Si WinRM no se puede iniciar de forma remota](#si-winrm-no-se-puede-iniciar-de-forma-remota) |
 | "WinRM no responde en ..." | WinRM detenido o puerto 5985 bloqueado | Revisar firewall o ejecutar `Test-NetConnection <IP> -Port 5985` |
 | Access Denied al abrir sesión | Credenciales incorrectas o el usuario no es admin | Escribe `c` en el prompt de la IP para volver a ingresar las credenciales y verifica la pertenencia al grupo Administradores local del destino |
@@ -292,15 +318,15 @@ Script finalizado.
 
 ### Si WinRM no se puede iniciar de forma remota
 
-El aviso `Timed out` en el paso 4 (o la falta de respuesta a ping) **no significa necesariamente que WinRM esté apagado**: el script continúa e intenta conectar por el puerto 5985. Puedes comprobarlo desde tu equipo:
+La falta de respuesta a ping o el aviso `Timed out` del paso 4 **no significan necesariamente que WinRM esté apagado**. Desde esta versión el script comprueba los puertos 5985 y 135 antes de pedir credenciales (ver [Flujo paso a paso](#flujo-paso-a-paso)) y te avisa si ninguno responde. Para comprobarlos a mano desde tu equipo:
 
 ```powershell
 Test-NetConnection 10.158.135.163 -Port 5985    # WinRM
 Test-NetConnection 10.158.135.163 -Port 135     # DCOM (el que usa el script para iniciar el servicio)
 ```
 
-- Si el **5985** responde `True`, WinRM ya está activo: usa `-SkipServiceSetup`.
-- Si ambos responden `False`, el equipo probablemente está apagado, en otra red o con el firewall bloqueando. En ese caso hay que actuar en el propio equipo o por GPO.
+- Si el **5985** responde `True`, WinRM ya está activo: el script lo detecta y omite el inicio remoto del servicio.
+- Si ambos responden `False`, el equipo probablemente está apagado, en otra red o con el firewall bloqueando. El script lo avisa y pregunta antes de continuar; para dejarlo listo hay que actuar en el propio equipo o por GPO.
 
 **Desde el propio equipo remoto** (PowerShell como administrador):
 
@@ -348,6 +374,7 @@ sc.exe \\10.158.135.163 start WinRM
 - El prompt remoto es propio, no `Enter-PSSession`: un comando por línea, sin autocompletado con Tab y sin programas interactivos.
 - `-MacAddress` y `-ExpectedHostName` solo aplican a la primera conexión del script.
 - La verificación de MAC solo funciona si el equipo está en la misma subred.
+- La prueba de puertos espera como máximo 2 segundos; en un enlace muy lento podría dar un falso "no alcanzable". En ese caso responde `s` a `¿Intentar conectar de todos modos?`.
 - Si el proceso se interrumpe de forma abrupta (cierre forzado de la ventana, apagón), la IP puede quedar en `TrustedHosts` y habría que retirarla manualmente.
 
 ---
@@ -383,6 +410,8 @@ Clear-Item WSMan:\localhost\Client\TrustedHosts -Force
 | Dominio, usuario y contraseña se pedían en cada ejecución | Se piden **una sola vez** y se reutilizan hasta cerrar el script; `c` los descarta |
 | Una IP inválida o vacía terminaba el script | Vuelve a preguntar. Solo un `-MacAddress` inválido pasado por parámetro termina el script (código 1) |
 | `-MacAddress` y `-ExpectedHostName` aplicaban a la única conexión | Aplican solo a la primera conexión |
+| Ante un equipo inalcanzable, esperaba el timeout de DCOM (hasta 20 s) y los reintentos de WinRM | Prueba los puertos 5985 y 135 **antes de pedir credenciales**: omite el inicio remoto si WinRM ya responde y, si ninguno responde, avisa y pregunta antes de continuar |
+| El lanzador `.bat` mantenía la consola abierta con `-NoExit` | Cierra la ventana al terminar y solo hace una pausa si el script termina con error |
 | El README no mencionaba el lanzador | Se documenta `configure-remote.bat`: elevación automática, `ExecutionPolicy Bypass` solo para el proceso y paso de argumentos al script |
 | La documentación decía que WinRM quedaba en inicio automático | Corrección de la documentación: por defecto solo se **inicia** el servicio; el inicio automático requiere `-EnableAutoStart` |
 
